@@ -381,48 +381,70 @@ def _price_from_official_api(symbol: str, exchange: str, period_days: int):
 
 def _price_from_yfinance(ticker: str, period_days: int):
     """
-    yfinance 備援方案：優先使用 curl_cffi 模擬 Chrome TLS 指紋，
-    繞過 Yahoo Finance 對雲端伺服器 IP 的封鎖；
-    curl_cffi 不可用時回退至標準 requests session
+    直接呼叫 Yahoo Finance Chart API v8，使用 curl_cffi 模擬 Chrome TLS 指紋。
+    完全繞過 yfinance 的 session 機制（yfinance session 與 curl_cffi 相容性有問題）。
+    curl_cffi 不可用時回退至標準 requests。
     """
-    if CURL_CFFI_AVAILABLE:
-        session = curl_requests.Session(impersonate="chrome110")
+    # 決定 range 字串
+    if period_days <= 90:
+        range_str = "3mo"
+    elif period_days <= 180:
+        range_str = "6mo"
+    elif period_days <= 365:
+        range_str = "1y"
     else:
-        session = requests.Session()
-        session.headers.update(_HEADERS)
+        range_str = "5y"
 
-    period_str = {90: "3mo", 180: "6mo", 365: "1y"}.get(
-        min([90, 180, 365, 99999], key=lambda x: abs(x - period_days)),
-        "5y"
-    )
-    if period_days > 365:
-        period_str = "5y"
+    url = f"https://query2.finance.yahoo.com/v8/finance/chart/{ticker}"
+    params = {"interval": "1d", "range": range_str}
 
     for attempt in range(2):
         try:
-            tkr = yf.Ticker(ticker, session=session)
-            df  = tkr.history(period=period_str, auto_adjust=True, actions=False)
+            if CURL_CFFI_AVAILABLE:
+                resp = curl_requests.get(
+                    url, params=params, impersonate="chrome110", timeout=20
+                )
+            else:
+                resp = requests.get(url, params=params, headers=_HEADERS, timeout=20)
 
-            if df.empty or "Close" not in df.columns:
+            data = resp.json()
+            result_list = data.get("chart", {}).get("result")
+            if not result_list:
+                err = data.get("chart", {}).get("error")
+                log_error(f"{ticker} Yahoo Chart API 無資料: {err}")
                 time.sleep(2)
                 continue
 
-            close = df["Close"].dropna()
-            if isinstance(close, pd.DataFrame):
-                close = close.iloc[:, 0]
+            result = result_list[0]
+            timestamps = result.get("timestamp", [])
 
-            # 移除時區（台股含 Asia/Taipei，避免 pickle 衝突）
-            if hasattr(close.index, "tz") and close.index.tz is not None:
-                close.index = close.index.tz_localize(None)
+            # 優先使用還原後收盤價（adjclose），退而使用原始收盤價
+            adj_list = result.get("indicators", {}).get("adjclose", [])
+            if adj_list and adj_list[0].get("adjclose"):
+                closes = adj_list[0]["adjclose"]
+            else:
+                closes = result.get("indicators", {}).get("quote", [{}])[0].get("close", [])
+
+            if not timestamps or not closes:
+                time.sleep(2)
+                continue
+
+            # UTC Unix timestamp → 台灣日期（移除時區資訊）
+            dates = (
+                pd.to_datetime(timestamps, unit="s")
+                  .tz_localize("UTC")
+                  .tz_convert("Asia/Taipei")
+                  .tz_localize(None)
+            )
+            series = pd.Series(closes, index=dates, dtype=float, name=ticker).dropna()
 
             cutoff = datetime.now() - timedelta(days=period_days)
-            close  = close[close.index >= cutoff]
-            close.name = ticker
+            series = series[series.index >= cutoff]
 
-            return close if len(close) >= 20 else None
+            return series if len(series) >= 20 else None
 
         except Exception as e:
-            log_error(f"{ticker} yfinance attempt {attempt+1}: {e}")
+            log_error(f"{ticker} Yahoo Chart API attempt {attempt+1}: {e}")
             time.sleep(2)
 
     return None
