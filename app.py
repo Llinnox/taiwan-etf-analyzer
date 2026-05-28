@@ -21,6 +21,13 @@ try:
 except ImportError:
     BS4_AVAILABLE = False
 
+# curl_cffi 可模擬真實瀏覽器 TLS 指紋，避免 Yahoo Finance 封鎖雲端伺服器 IP
+try:
+    from curl_cffi import requests as curl_requests
+    CURL_CFFI_AVAILABLE = True
+except ImportError:
+    CURL_CFFI_AVAILABLE = False
+
 app = Flask(__name__)
 
 # ========== 全域設定 ==========
@@ -280,12 +287,15 @@ def _fetch_twse_month(symbol: str, year: int, month: int) -> pd.Series:
     """
     從台灣證交所 STOCK_DAY API 抓取單月日收盤價
     回傳 index=日期(Timestamp), values=收盤價 的 Series
+    優先使用 curl_cffi 繞過防爬蟲機制
     """
-    resp = requests.get(
+    fetch = curl_requests.get if CURL_CFFI_AVAILABLE else requests.get
+    kwargs = {"impersonate": "chrome110"} if CURL_CFFI_AVAILABLE else {"headers": _HEADERS}
+    resp = fetch(
         "https://www.twse.com.tw/exchangeReport/STOCK_DAY",
         params={"response": "json", "date": f"{year}{month:02d}01", "stockNo": symbol},
-        headers=_HEADERS,
         timeout=12,
+        **kwargs,
     )
     data = resp.json()
     if data.get("stat") != "OK" or not data.get("data"):
@@ -306,12 +316,15 @@ def _fetch_twse_month(symbol: str, year: int, month: int) -> pd.Series:
 def _fetch_tpex_month(symbol: str, year: int, month: int) -> pd.Series:
     """
     從櫃買中心 st43 API 抓取單月日收盤價（上櫃 ETF）
+    優先使用 curl_cffi 繞過防爬蟲機制
     """
-    resp = requests.get(
+    fetch = curl_requests.get if CURL_CFFI_AVAILABLE else requests.get
+    kwargs = {"impersonate": "chrome110"} if CURL_CFFI_AVAILABLE else {"headers": _HEADERS}
+    resp = fetch(
         "https://www.tpex.org.tw/web/stock/aftertrading/daily_trading_info/st43_result.php",
         params={"l": "zh-tw", "d": f"{year}/{month:02d}", "s": f"{symbol},asc,0"},
-        headers=_HEADERS,
         timeout=12,
+        **kwargs,
     )
     data = resp.json()
     rows = data.get("aaData") or data.get("data") or []
@@ -353,7 +366,7 @@ def _price_from_official_api(symbol: str, exchange: str, period_days: int):
             s = fetch_fn(symbol, y, m)
             if not s.empty:
                 parts.append(s)
-            time.sleep(0.35)   # 避免被官方 API 限流
+            time.sleep(0.15)   # 避免被官方 API 限流（縮短以防 Render 請求超時）
         except Exception as e:
             log_error(f"{symbol} 官方API {y}/{m}: {e}")
 
@@ -368,11 +381,15 @@ def _price_from_official_api(symbol: str, exchange: str, period_days: int):
 
 def _price_from_yfinance(ticker: str, period_days: int):
     """
-    yfinance 備援方案：使用瀏覽器模擬 session + period 字串
-    避免 YFTzMissingError 與 start/end 日期時區問題
+    yfinance 備援方案：優先使用 curl_cffi 模擬 Chrome TLS 指紋，
+    繞過 Yahoo Finance 對雲端伺服器 IP 的封鎖；
+    curl_cffi 不可用時回退至標準 requests session
     """
-    session = requests.Session()
-    session.headers.update(_HEADERS)
+    if CURL_CFFI_AVAILABLE:
+        session = curl_requests.Session(impersonate="chrome110")
+    else:
+        session = requests.Session()
+        session.headers.update(_HEADERS)
 
     period_str = {90: "3mo", 180: "6mo", 365: "1y"}.get(
         min([90, 180, 365, 99999], key=lambda x: abs(x - period_days)),
@@ -571,8 +588,12 @@ def get_market_cap(ticker: str) -> float | None:
     加入指數退避重試（最多3次），避免 Yahoo Finance 429 限流
     失敗時回傳 None
     """
-    session = requests.Session()
-    session.headers.update(_HEADERS)
+    # 優先使用 curl_cffi 避免雲端 IP 被 Yahoo Finance 封鎖
+    if CURL_CFFI_AVAILABLE:
+        session = curl_requests.Session(impersonate="chrome110")
+    else:
+        session = requests.Session()
+        session.headers.update(_HEADERS)
 
     for attempt in range(3):
         try:
