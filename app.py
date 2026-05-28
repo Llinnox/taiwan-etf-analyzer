@@ -473,23 +473,22 @@ def get_price_data(ticker: str, period_days: int = 365):
 
     close = None
 
-    if ticker.endswith(".TW"):
-        symbol = ticker[:-3]
-        close  = _price_from_official_api(symbol, "TW", period_days)
-        if close is None:
-            log_error(f"{ticker}: TWSE API 失敗，改用 yfinance 備援")
-            close = _price_from_yfinance(ticker, period_days)
+    # 策略：Yahoo Finance v8 API（快，單次請求）→ TWSE/TPEX 官方 API（慢，月份逐一抓取）
+    # 優先走 Yahoo Finance，避免 TWSE 月份逐一抓取導致 gunicorn timeout
 
-    elif ticker.endswith(".TWO"):
-        symbol = ticker[:-4]
-        close  = _price_from_official_api(symbol, "TWO", period_days)
-        if close is None:
-            log_error(f"{ticker}: TPEX API 失敗，改用 yfinance 備援")
-            close = _price_from_yfinance(ticker, period_days)
+    # 第一優先：Yahoo Finance Chart API v8（適用所有標的）
+    close = _price_from_yfinance(ticker, period_days)
 
-    else:
-        # 基準指數或其他（^TWII 等）
-        close = _price_from_yfinance(ticker, period_days)
+    # 第二優先：TWSE / TPEX 官方 API（Yahoo 失敗才啟用）
+    if close is None:
+        if ticker.endswith(".TW"):
+            symbol = ticker[:-3]
+            log_error(f"{ticker}: Yahoo API 失敗，改用 TWSE 官方 API 備援")
+            close = _price_from_official_api(symbol, "TW", period_days)
+        elif ticker.endswith(".TWO"):
+            symbol = ticker[:-4]
+            log_error(f"{ticker}: Yahoo API 失敗，改用 TPEX 官方 API 備援")
+            close = _price_from_official_api(symbol, "TWO", period_days)
 
     if close is not None:
         close.name = ticker
